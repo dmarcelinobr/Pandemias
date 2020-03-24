@@ -1,0 +1,359 @@
+---
+title: "Análise dos casos de COVID-19 no Brasil"
+author: "Daniel Marcelino | Jota"
+date: "Março de 2020"
+output:
+  prettydoc::html_pretty:
+    theme: hpstr
+    highlight: github
+    self_contained: true
+    number_sections: false
+    math: katex
+---
+
+
+```{r setup, include = FALSE, message = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = "",
+  echo = TRUE,
+  cache = FALSE,
+  fig.align = "center",
+  fig.width = 6,
+  fig.height = 4.5,
+  fig.retina = 2,
+  out.width = "100%"
+)
+
+options(encoding="UTF-8")
+localeToCharset()
+```
+
+
+## Apresentação
+
+Considerando algumas informações, podemos assumir no momento que:
+
+Uma pessoa infectada pode morrer após cerca de 22 dias de infecção (embora no modelo, os indivíduos possam morrer entre 6 e 22 sem estabelecer alguma distinção entre eles).
+Uma pessoa infectada, para se recuperar, mas isso só acontece após cerca de 27 dias da infecção.
+Uma pessoa infectada pode infectar outras pessoas durante todo o período até que finalmente venha a óbito ou se recupere.
+
+## Modelo bruto
+
+```{r }
+crude_model1 <- "data{
+  int<lower=0> N;
+  int<lower=0> day0;
+  vector[N] day;
+  vector[N] deaths;
+}
+
+parameters{
+  real<lower = 0, upper = 1000> casos_0;
+  vector[N] contagios;
+  real<lower = 0, upper = 3> r0;  // priori cutre sobre r0, infectados diários que gera um caso
+  real<lower = 0, upper = .02> letalidade;
+}
+
+model{
+  vector[N] casos;
+  
+  contagios[1] ~ normal(casos_0 * r0, 1);
+  casos[1] = casos_0 + contagios[1];
+  
+  
+  for (i in 2:N){
+    contagios[i] ~ normal(casos[i-1] * r0, 1);
+    casos[i] = casos[i-1] + contagios[i];
+  }
+  
+  for (i in day0:N) {
+    deaths[i] ~ normal(letalidade * casos[i - 22], 1);
+  }
+}"
+
+```
+
+
+
+
+O modelo a seguir tem una limitação importante: todos as mais de 209 milhões de pessoas têm a mesma probabilidade de morrer em caso de contágio. Por outro lado, foi introduzida variabilidade na taxa de transmissão (não vai ser igual para toda a população porque a maior parte está confinada em casa) implementando algo parecido com um gaussian random field (GRF) como no INLA para o parâmetro R0 do modelo.
+
+```{r}
+crude_model2 <- "data{
+  int<lower=0> N;
+  int<lower=0> day0;
+  int<lower=0> pop;
+  vector[N] day;
+  vector[N] deaths;
+  vector[N] casos_obs;  
+}
+
+parameters {
+  real<lower = 0, upper = 1> letalidade;  
+  real<lower = 0, upper = 1000> casos_0; 
+  vector<lower = 0, upper = .5>[N] r0;
+  real<lower = 0> sigma_delta_r0;  
+  real<lower = 0> sigma_obs;
+}
+
+transformed parameters {
+  vector[N] casos;
+  vector[N] contagios;
+
+  contagios[1] = casos_0 * r0[1];
+  casos[1]     = casos_0 + contagios[1];
+  
+  for (i in 2:N) {
+    
+    real contagiadores = 0;
+    for (j in max(1, i - 27):(i-1)) {
+      contagiadores = contagiadores + contagios[j];
+    }
+  
+    contagios[i] = fmax(0, (1 - casos[i-1] / pop)) * contagiadores * r0[i];
+    casos[i] = casos[i-1] + contagios[i];
+  }
+}
+
+model {
+  // prior
+  letalidade ~ normal(0.01, 0.01);
+  sigma_delta_r0 ~ normal(0, .001);
+  sigma_obs ~ normal(0, .25);
+  
+  // first iteration
+  r0[1] ~ normal(.03, .02);
+  for (i in 2:N)
+    r0[i] ~ normal(r0[i-1], sigma_delta_r0);
+
+  // only people catching coronavirus 22 days ago can die
+  for (i in 1:N) {
+    
+    // normal approximation to binomial
+    if (i > 7) {
+      
+      real em_risco = 0;
+      for (j in max(1, i - 22):(i-6)) {
+        em_risco = em_risco + contagios[j];
+      }
+      
+      deaths[i] ~ normal(letalidade * em_risco, sqrt(letalidade * em_risco)); 
+    }
+
+    // observation error grows with the number of existing cases
+    casos_obs[i] ~ normal(casos[i], casos[i] * sigma_obs); 
+  }
+}"
+
+```
+
+---
+
+
+## Resultado do modelo bruto
+
+```{r, eval=FALSE}
+library(rstan)
+library(ggplot2)
+library(jotaR)
+library(tidyverse)
+library(data.table)
+library(reshape2)
+
+options(warn=-1, message =-1)
+options(mc.cores = parallel::detectCores())
+
+
+library(ggplot2)
+
+brasil <- read_csv("dados/corona_brasil01.csv")
+
+brasil$date <- lubridate::ymd(brasil$date)
+
+
+brasil <- brasil %>% 
+  dplyr::group_by(date) %>% 
+  dplyr::summarize(
+            refuses = sum(refuses),
+            suspects = sum(suspects),
+            cases = sum(cases),
+            deaths = sum(deaths))
+  
+
+date_ini <- filter(brasil, cases==0) %>% last() %>% pull(date)
+date_end <- max(brasil$date)
+
+
+brasil$day <- as.numeric(brasil$date - date_ini)
+ 
+# tmp <- data.frame(dia = -30:-1, deaths = 0)
+# brasil <- rbind(tmp, brasil)
+
+fit <- stan(model_code = crude_model1,
+                       data = list(N = nrow(brasil), 
+                        day0 = which(brasil$day == 0), 
+                        day = brasil$day, 
+                        deaths = brasil$deaths),
+            iter = 10000, warmup = 2000,
+            chains = 1, thin = 10)
+ 
+res <- as.data.frame(fit)
+ 
+
+contagios <-  rstan::extract(fit, pars = "contagios")$contagios
+contagios <- data.frame(t(contagios))
+contagios$date <- as.Date(brasil$date, origin = date_ini)
+contagios <- melt(contagios, id.vars = "date")
+ 
+
+casos <- contagios %>% 
+  dplyr::group_by(variable) %>%
+  dplyr::mutate(casos = cumsum(value))
+
+ 
+ggplot(casos, aes(x = date, y = casos, group = variable)) +
+    geom_line(alpha = 0.3) +
+    xlab("Data") + ylab("Casos") +
+  ggtitle("Número de casos de COVID-19 no Brasil") +
+  scale_x_date(breaks = "1 week", date_labels = "%b'%d") +
+  theme_jota(base_size = 11, plot_title_size = 16) + 
+  geom_hline(yintercept = 0, size = 0.85, colour="#333333")
+```
+
+
+---
+
+
+## Resultado do modelo mais sofisticado
+```{r}
+library(rstan)
+library(ggplot2)
+library(jotaR)
+library(tidyverse)
+library(data.table)
+library(reshape2)
+library(rstanarm)
+
+options(warn=-1, message =-1)
+options(mc.cores = parallel::detectCores())
+
+
+brasil <- read_csv("dados/corona_brasil01.csv")
+
+brasil$date <- lubridate::ymd(brasil$date)
+ 
+
+brasil <- brasil %>% 
+  dplyr::group_by(date) %>% 
+  dplyr::summarize(
+            refuses = sum(refuses),
+            suspects = sum(suspects),
+            cases = sum(cases),
+            deaths = sum(deaths))
+  
+date_ini <- filter(brasil, cases==0) %>% last() %>% pull(date)
+date_end <- max(brasil$date)
+
+brasil$day <- as.numeric(brasil$date - date_ini)
+
+
+pop_brasil <- 209100000 
+# tmp <- data.frame(day = -30:-1, defs = 0, cases = 0)
+
+# brasil <- rbind(tmp, brasil[, c("day", "deaths", "cases")])
+# brasil <- data.frame(day = brasil$day[-1], deaths = diff(brasil$deaths), cases = diff(brasil$cases))
+
+
+
+fit <- stan(model_code = crude_model2,
+            data = list(N    = nrow(brasil), 
+                        day0 = which(brasil$day == 0), 
+                        pop  = pop_brasil,                           
+                        day  = brasil$day,
+                        deaths = brasil$deaths,
+                        casos_obs = brasil$cases), 
+            iter = 10000, warmup = 2000, 
+            chains = 4, thin = 10, cores = 4,
+            include = FALSE, pars = "contagios")
+
+res <- as.data.frame(fit)
+
+
+
+est_casos <- rstan::extract(fit, pars = "casos")$casos
+est_casos <- data.frame(t(est_casos))
+est_casos$date <- as.Date(brasil$date, origin = date_ini)
+est_casos <- melt(est_casos, id.vars = "date")
+colnames(est_casos) <- c("date", "variable", "cases")
+
+ggplot() +
+    geom_line(data = est_casos, aes(x = date, y = cases, group = variable), alpha = 0.01) + 
+    geom_line(data = brasil, aes(x = date, y = cases), col = "red") + 
+    xlab("Data") + ylab("Casos") +
+    ggtitle("Número de casos de COVID-19 no Brasil") +
+  scale_x_date(breaks = "1 week", date_labels = "%b'%d") +
+   theme_jota(base_size = 11, plot_title_size = 16) + 
+  geom_hline(yintercept = 0, size = 0.85, colour="#333333")
+```
+
+
+
+---
+
+
+```{r}
+tmp <- est_casos[est_casos$date == max(est_casos$date),]
+# tmp$cases <- tmp$cases / 1000
+
+ggplot(tmp, aes(x = cases)) + 
+    geom_histogram(fill = "steelblue", bins = 50) + 
+    xlab("Casos") +
+    ylab("Número de simulações") +
+    ggtitle(paste0("Número de casos estimados em ", 
+                   format(date_end,format="%d/%m/%Y"))) +
+  theme_jota(base_size = 11,  plot_title_size = 16) + 
+   geom_hline(yintercept = 0, size = 0.85, colour="#333333")
+```
+
+
+
+
+```{r, eval=FALSE}
+r0 <- rstan::extract(fit, pars = "r0")$r0
+r0 <- data.frame(t(r0))
+r0$date <- as.Date(brasil$date, origin = date_ini)
+r0 <- melt(r0, id.vars = "date")
+colnames(r0) <- c("date", "variable", "r0")
+
+
+ggplot(r0, aes(x = date, y = r0, group = variable)) +
+    geom_line(alpha = 0.01) + 
+    xlab("date") + ylab("r0") +
+    ggtitle("Número de casos de coronavirus no Brasil") +
+    theme_jota(base_size = 11,  plot_title_size = 16) + 
+   geom_hline(yintercept = 0, size = 0.85, colour="#333333")
+
+```
+
+
+## Perfomance do modelo
+
+```{r}
+rstan::traceplot(fit, pars = 
+                   c("casos_0",
+                     "letalidade",
+                     "sigma_delta_r0"),
+                 nrow=3)
+
+
+# Avaliação do ajuste do modelo
+pairs(fit, pars = c("casos", "contagios", "r0"), include = FALSE)
+```
+
+
+---
+
+@dmarcelinobr | daniel.marcelino@jota.info
