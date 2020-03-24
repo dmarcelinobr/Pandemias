@@ -53,7 +53,7 @@ crude_model1 <- "data{
 parameters{
   real<lower = 0, upper = 1000> casos_0;
   vector[N] contagios;
-  real<lower = 0, upper = 3> r0;  // priori cutre sobre r0, infectados diários que gera um caso
+  real<lower = 0, upper = 3> r0;  // priori bounds sobre r0, infectados diários que gera um caso
   real<lower = 0, upper = .02> letalidade;
 }
 
